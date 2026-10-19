@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""ghl-session — manage the self-renewing GHL internal-API session.
+
+  ghl-session from-browser [--cdp URL]   copy login cookies from a logged-in browser (CDP)
+  ghl-session status                      token lifetimes (no secrets printed)
+  ghl-session refresh                     force-renew now (keep-alive timer calls this)
+  ghl-session call METHOD PATH [--data JSON|@file]
+                                          raw internal API call, e.g.
+                                          ghl-session call GET /workflow/<loc>/list
+"""
+import argparse
+import asyncio
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+ROOT = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, ROOT)
+from cli_anything.gohighlevel.utils import ghl_session  # noqa: E402
+
+BACKEND = "https://backend.leadconnectorhq.com"
+
+
+async def _cookies(cdp: str) -> dict:
+    from playwright.async_api import async_playwright
+    async with async_playwright() as p:
+        b = await p.chromium.connect_over_cdp(cdp)
+        cs = await b.contexts[0].cookies(["https://app.gohighlevel.com"])
+        return {c["name"]: c["value"] for c in cs}
+
+
+def cmd_from_browser(a):
+    sess = ghl_session.from_cookies(asyncio.run(_cookies(a.cdp)))
+    sess = ghl_session.refresh(sess)  # proves the refresh path works before we rely on it
+    ghl_session.save(sess)
+    print(json.dumps(ghl_session.status(), indent=1))
+
+
+def cmd_status(a):
+    print(json.dumps(ghl_session.status(), indent=1))
+
+
+def cmd_refresh(a):
+    sess = ghl_session.load()
+    if not sess:
+        sys.exit("no session — run `ghl-session from-browser` first")
+    ghl_session.refresh(sess)
+    print(json.dumps(ghl_session.status(), indent=1))
+
+
+def cmd_call(a):
+    tok = ghl_session.access_token()
+    if not tok:
+        sys.exit("no session — run `ghl-session from-browser` first")
+    data = None
+    if a.data:
+        raw = open(a.data[1:]).read() if a.data.startswith("@") else a.data
+        data = json.dumps(json.loads(raw)).encode()
+    req = urllib.request.Request(
+        BACKEND + a.path, method=a.method.upper(), data=data,
+        headers={
+            "Authorization": f"Bearer {tok}", "channel": "APP", "source": "WEB_USER",
+            "version": "2021-07-28", "Content-Type": "application/json",
+            "Accept": "application/json", "User-Agent": ghl_session.UA,
+            "origin": "https://client-app-automation-workflows.leadconnectorhq.com",
+            "referer": "https://client-app-automation-workflows.leadconnectorhq.com/",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            body = r.read().decode()
+            code = r.status
+    except urllib.error.HTTPError as e:
+        body, code = e.read().decode(), e.code
+    try:
+        print(json.dumps(json.loads(body), indent=1))
+    except ValueError:
+        print(body)
+    if code >= 400:
+        sys.exit(f"HTTP {code}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("from-browser"); s.add_argument("--cdp", default="http://localhost:9222"); s.set_defaults(f=cmd_from_browser)
+    sub.add_parser("status").set_defaults(f=cmd_status)
+    sub.add_parser("refresh").set_defaults(f=cmd_refresh)
+    s = sub.add_parser("call"); s.add_argument("method"); s.add_argument("path"); s.add_argument("--data"); s.set_defaults(f=cmd_call)
+    a = ap.parse_args()
+    try:
+        a.f(a)
+    except ghl_session.SessionError as e:
+        sys.exit(f"error: {e}")
+
+
+if __name__ == "__main__":
+    main()

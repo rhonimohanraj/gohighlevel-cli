@@ -46,6 +46,8 @@ class TokenManager:
     def __init__(self):
         self._token: Optional[str] = None
         self._token_time: float = 0
+        self._session_token = False
+        self._force = False
 
     def get_token(self) -> str:
         """Get a valid backend bearer (GHL-native JWT) or Firebase token."""
@@ -55,6 +57,19 @@ class TokenManager:
         bearer = self._load_backend_bearer()
         if bearer:
             return bearer
+
+        # 0b. Self-renewing session file (ghl_session.py) — preferred unattended path.
+        from cli_anything.gohighlevel.utils import ghl_session
+        try:
+            tok = ghl_session.access_token(force=self._force)
+        except ghl_session.SessionError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        finally:
+            self._force = False
+        if tok:
+            self._session_token = True
+            return tok
 
         # 1. Check if current token is still fresh (< 50 min)
         if self._token and (time.time() - self._token_time) < 3000:
@@ -95,12 +110,13 @@ class TokenManager:
         """Force token refresh (called on 401)."""
         self._token = None
         self._token_time = 0
+        self._force = True
         return self.get_token()
 
     def is_backend_bearer(self) -> bool:
         """True when the active token is a GHL-native bearer (Authorization: Bearer)
         rather than a Firebase id-token (token-id header)."""
-        return bool(self._load_backend_bearer())
+        return self._session_token or bool(self._load_backend_bearer())
 
     def _load_backend_bearer(self) -> Optional[str]:
         """Load a GHL-native backend bearer from env or a _ghl_bearer.txt file,
