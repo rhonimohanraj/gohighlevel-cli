@@ -205,6 +205,7 @@ class InternalGHLClient:
         headers = {
             "channel": "APP",
             "source": "WEB_USER",
+            "version": "2021-07-28",  # required by the /emails service (401 without it)
             "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
             "User-Agent": CHROME_UA,

@@ -526,6 +526,164 @@ def calendars_groups(ctx):
 
 
 # ===========================================================================
+# NEWSLETTERS (email campaigns via internal API, experimental)
+# ===========================================================================
+
+def _newsletters(ctx: click.Context):
+    _require_experimental(ctx)
+    from cli_anything.gohighlevel.utils.ghl_newsletter import Newsletters
+    return Newsletters(_get_internal_client(ctx))
+
+
+def _nl_call(fn):
+    from cli_anything.gohighlevel.utils.ghl_newsletter import NewsletterError
+    try:
+        return fn()
+    except NewsletterError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+
+@cli.group()
+@click.pass_context
+def newsletter(ctx):
+    """Email campaigns (newsletters): build drafts, send or schedule. Requires --experimental."""
+    pass
+
+
+@newsletter.command("list")
+@click.option("--limit", default=50, type=int)
+@click.option("--status", default="all", help="all|draft|scheduled|complete|...")
+@click.pass_context
+def newsletter_list(ctx, limit, status):
+    """List email campaigns."""
+    nl = _newsletters(ctx)
+    res = _nl_call(lambda: nl.list(limit=limit, status=status))
+    rows = [{"id": r.get("_id") or r.get("id"), "name": r.get("name"), "status": r.get("status"),
+             "updated": r.get("updatedAt") or r.get("lastUpdatedAt")} for r in res.get("schedules", [])]
+    _output(ctx, rows, "Newsletters")
+
+
+@newsletter.command("get")
+@click.argument("campaign_id")
+@click.option("--html", "show_html", is_flag=True, help="Print the saved HTML instead of the record")
+@click.pass_context
+def newsletter_get(ctx, campaign_id, show_html):
+    """Show a campaign (subject, from, status) or its HTML."""
+    nl = _newsletters(ctx)
+    if show_html:
+        click.echo(_nl_call(lambda: nl.get_html(campaign_id)).get("editorData", ""))
+        return
+    r = _nl_call(lambda: nl.get(campaign_id))
+    specs = ((r.get("meta") or {}).get("bulkReqInfo") or {}).get("opSpecs") or {}
+    _output(ctx, {"id": r.get("_id"), "name": r.get("name"), "status": r.get("status"),
+                  "subject": specs.get("subject"), "from": specs.get("from"),
+                  "previewText": (r.get("meta") or {}).get("previewText")}, "Newsletter")
+
+
+def _apply_meta(nl, cid, name, subject, from_name, from_email, reply_to, preview_text):
+    if any(v is not None for v in (name, subject, from_name, from_email, reply_to, preview_text)):
+        _nl_call(lambda: nl.update_meta(cid, name=name, subject=subject, from_name=from_name,
+                                        from_email=from_email, reply_to=reply_to, preview_text=preview_text))
+
+
+_meta_opts = [
+    click.option("--subject", default=None),
+    click.option("--from-name", default=None),
+    click.option("--from-email", default=None),
+    click.option("--reply-to", default=None),
+    click.option("--preview-text", default=None, help="Preheader shown in the inbox"),
+]
+
+
+def _with_meta(f):
+    for o in reversed(_meta_opts):
+        f = o(f)
+    return f
+
+
+@newsletter.command("create")
+@click.option("--name", required=True, help="Internal campaign name")
+@click.option("--html", "html_file", required=True, type=click.Path(exists=True), help="HTML file (code editor)")
+@_with_meta
+@click.pass_context
+def newsletter_create(ctx, name, html_file, subject, from_name, from_email, reply_to, preview_text):
+    """Create a DRAFT newsletter from an HTML file. Never sends."""
+    nl = _newsletters(ctx)
+    html = open(html_file, encoding="utf-8").read()
+    cid = _nl_call(lambda: nl.create(name))
+    saved = _nl_call(lambda: nl.save_html(cid, html, preview_text or ""))
+    _apply_meta(nl, cid, None, subject, from_name, from_email, reply_to, preview_text)
+    _output(ctx, {"id": cid, "status": "draft", "previewUrl": saved.get("previewUrl"),
+                  "edit": f"https://app.gohighlevel.com/location/{nl.loc}/emails/campaigns/create/{cid}"},
+            "Newsletter draft created")
+
+
+@newsletter.command("update")
+@click.argument("campaign_id")
+@click.option("--name", default=None)
+@click.option("--html", "html_file", default=None, type=click.Path(exists=True))
+@_with_meta
+@click.pass_context
+def newsletter_update(ctx, campaign_id, name, html_file, subject, from_name, from_email, reply_to, preview_text):
+    """Update a draft's HTML and/or name, subject, sender, preview text."""
+    nl = _newsletters(ctx)
+    out = {"id": campaign_id}
+    if html_file:
+        saved = _nl_call(lambda: nl.save_html(campaign_id, open(html_file, encoding="utf-8").read(), preview_text or ""))
+        out["previewUrl"] = saved.get("previewUrl")
+    _apply_meta(nl, campaign_id, name, subject, from_name, from_email, reply_to, preview_text)
+    out["updated"] = True
+    _output(ctx, out, "Newsletter updated")
+
+
+@newsletter.command("delete")
+@click.argument("campaign_id")
+@click.option("--yes", is_flag=True, help="Confirm deletion")
+@click.pass_context
+def newsletter_delete(ctx, campaign_id, yes):
+    """Delete a campaign."""
+    if not yes:
+        click.echo("Refusing without --yes", err=True); sys.exit(1)
+    nl = _newsletters(ctx)
+    _output(ctx, _nl_call(lambda: nl.delete(campaign_id)), "Deleted")
+
+
+@newsletter.command("send")
+@click.argument("campaign_id")
+@click.option("--tag", "tags", multiple=True, help="Audience: contacts with this tag (repeatable)")
+@click.option("--contact", "contacts", multiple=True, help="Audience: contact ID (repeatable)")
+@click.option("--all-contacts", is_flag=True, help="Audience: every contact in the location")
+@click.option("--at", default=None, help="Schedule: 'YYYY-MM-DD hh:mm AM' in --timezone (omit = send now)")
+@click.option("--timezone", default="America/Winnipeg")
+@click.option("--no-track-clicks", is_flag=True)
+@click.option("--dry-run", is_flag=True, help="Print the request instead of sending")
+@click.option("--yes", is_flag=True, help="Required to actually send/schedule (client-visible)")
+@click.pass_context
+def newsletter_send(ctx, campaign_id, tags, contacts, all_contacts, at, timezone, no_track_clicks, dry_run, yes):
+    """SEND NOW or SCHEDULE a newsletter. Client-visible: needs --yes."""
+    nl = _newsletters(ctx)
+    payload = _nl_call(lambda: nl.build_start_payload(
+        campaign_id, tags=list(tags) or None, contact_ids=list(contacts) or None,
+        all_contacts=all_contacts, at=at, timezone=timezone, track_clicks=not no_track_clicks))
+    if dry_run or not yes:
+        click.echo(json.dumps(payload, indent=2))
+        if not dry_run:
+            click.echo("\nNot sent: add --yes to send/schedule for real.", err=True)
+        return
+    _output(ctx, _nl_call(lambda: nl.start(payload)), "Scheduled" if at else "Sending")
+
+
+@newsletter.command("cancel")
+@click.argument("campaign_id")
+@click.pass_context
+def newsletter_cancel(ctx, campaign_id):
+    """Cancel a scheduled newsletter."""
+    nl = _newsletters(ctx)
+    _output(ctx, _nl_call(lambda: nl.cancel(campaign_id)), "Cancelled")
+
+
+# ===========================================================================
 # WORKFLOWS
 # ===========================================================================
 
